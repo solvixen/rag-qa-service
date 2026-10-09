@@ -19,6 +19,35 @@ _DOC_MARK = re.compile(r"[\[【]\s*(KB-\d+)\s*[\]】]")
 _NUMBER = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
 _DATE_LIKE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
+EVIDENCE_NUMBER_BUDGET = 50
+
+
+def count_numbers(result: Any) -> int:
+    """数一条 result 里的数字个数（口径对齐 eval 的 extract_numbers 的近似）。"""
+    if result is None:
+        return 0
+    return len(_NUMBER.findall(json.dumps(result, ensure_ascii=False, default=str)))
+
+
+def trim_evidence(evidence: list[dict], max_numbers: int = EVIDENCE_NUMBER_BUDGET) -> list[dict]:
+    """evidence 数字总量预算（缺陷 26）：多次工具调用累加会越评测上限。
+
+    倒序收集（最近一次的调用最相关），放得下才留；一条都放不下时保底留最后一条，
+    避免 evidence 被裁空而挂掉 evidence_required。
+    """
+    kept: list[dict] = []
+    total = 0
+    for item in reversed(evidence):
+        n = count_numbers(item.get("result"))
+        if total + n <= max_numbers:
+            kept.append(item)
+            total += n
+    if not kept and evidence:
+        kept.append(evidence[-1])
+    kept.reverse()
+    return kept
+
+
 SYSTEM_PROMPT = """你是一家连锁餐饮公司的经营分析助手，服务对象是运营同事。
 今天固定是 {today}，所有“现在/最近/目前”都以这一天为准。
 数据区间只有 {start} 至 {end}，区间之外没有任何数据。
@@ -164,7 +193,7 @@ class LiveEngine:
             answer=text,
             answer_type=answer_type,
             citations=citations,
-            data_evidence=evidence,
+            data_evidence=trim_evidence(evidence),
         )
 
     def _citations(self, plan: Plan, doc_ids: list[str]) -> list[dict]:
