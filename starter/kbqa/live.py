@@ -123,7 +123,15 @@ class LiveEngine:
                     continue
                 started = time.perf_counter()
                 result = self.run_tool(name, params)
-                trace.step("tool", {"tool": name, "params": params}, started=started)
+                # 检索诊断只进 trace，不进模型上下文：模型看到的仍是干净的 results。
+                # 评审点名"看不到检索片段的分数和被过滤的原因"，说的就是这里。
+                diagnostics = (
+                    result.pop("_diagnostics", None) if isinstance(result, dict) else None
+                )
+                detail: dict[str, Any] = {"tool": name, "params": params}
+                if diagnostics is not None:
+                    detail["retrieval"] = diagnostics
+                trace.step("tool", detail, started=started)
                 if name == "search_kb":
                     retrieved[json.dumps(params, ensure_ascii=False)] = result.get("results", [])
                 elif "error" not in result:

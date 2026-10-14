@@ -17,7 +17,7 @@ from .index import load_index
 from .live import LiveEngine
 from .llm import LLMClient, LLMError
 from .planner import Planner
-from .retriever import Retriever
+from .retriever import Retriever, SearchResult
 from .sessions import SessionStore
 from .toolspec import TOOL_NAMES, TOOLS
 from .tools import DataTools
@@ -87,14 +87,18 @@ class Service:
     def metrics_daily(self, start: str, end: str, store_id=None, product_id=None) -> dict:
         return self.tools.daily_metrics(start, end, store_id, product_id)
 
+    def _search(self, query: str, top_k) -> SearchResult:
+        wanted = max(1, min(int(top_k or 5), len(self.index.chunks) or 1))
+        return self.retriever.search(query or "", top_k=wanted)
+
     def retrieve(self, query: str, top_k: int = 5) -> dict:
         """契约 §4：片段够就恰好给 top_k 条，不够才少给。
 
         `top_k` 大于索引里的片段总数时按总数封顶——这正是契约允许少给的那种情况。
+        对外只给 results：检索诊断（分数、过滤原因）属于内部观测数据，
+        由 run_tool 单独带出来给 trace 用，不进这个字段。
         """
-        wanted = max(1, min(int(top_k or 5), len(self.index.chunks) or 1))
-        result = self.retriever.search(query or "", top_k=wanted)
-        return {"results": [hit.as_result() for hit in result.hits]}
+        return {"results": [hit.as_result() for hit in self._search(query, top_k).hits]}
 
     #: read_doc 单次返回的正文字符上限，与 live 喂给模型的 6000 字符对齐。
     READ_DOC_LIMIT = 6000
@@ -155,7 +159,13 @@ class Service:
                 return {"error": "缺少必填参数 %s" % key}
         try:
             if name == "search_kb":
-                return self.retrieve(cleaned["query"], cleaned.get("top_k", 5))
+                result = self._search(cleaned["query"], cleaned.get("top_k", 5))
+                return {
+                    "results": [hit.as_result() for hit in result.hits],
+                    # 下划线开头，表示内部观测字段：live 侧会在喂给模型之前
+                    # 把它摘出来写进 trace（评审要看的就是这里的分数与过滤原因）。
+                    "_diagnostics": result.as_trace(),
+                }
             if name == "read_doc":
                 return self.read_doc(cleaned["doc_id"])
             return getattr(self.tools, name)(**cleaned)
