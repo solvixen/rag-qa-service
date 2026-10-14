@@ -96,6 +96,35 @@ class Service:
         result = self.retriever.search(query or "", top_k=wanted)
         return {"results": [hit.as_result() for hit in result.hits]}
 
+    #: read_doc 单次返回的正文字符上限，与 live 喂给模型的 6000 字符对齐。
+    READ_DOC_LIMIT = 6000
+
+    def read_doc(self, doc_id: str) -> dict:
+        """按编号读一篇文档的完整正文——检索链路之外的一条确定性通道。
+
+        T02 类问题的病灶是"召回了文档、召不回答案"：英文邮件里那段结论
+        （KB-022#9 "credit note of CNY 8,600"）不含任何中文查询词，BM25 给它
+        打不上分，top-k 里返回的是邮件标题行。模型已经知道文档编号时，
+        让它直接读全文，比反复换词重试可靠得多。
+
+        只读不写、不改索引，纯查询。
+        """
+        key = (doc_id or "").strip().upper()
+        if not key:
+            return {"error": "缺少必填参数 doc_id"}
+        meta = self.index.docs_meta.get(key)
+        if meta is None:
+            return {"error": "没有编号为 %s 的文档。编号可以从 search_kb 的检索结果里取。" % key}
+        text = self.index.texts.get(key, "")
+        if not text:
+            return {"error": "文档 %s 的正文是空的。" % key}
+        return {
+            "doc_id": key,
+            "title": meta.get("title") or "",
+            "text": text[: self.READ_DOC_LIMIT],
+            "truncated": len(text) > self.READ_DOC_LIMIT,
+        }
+
     # -- 工具执行（live 模式下由模型驱动） ---------------------------------------
 
     def run_tool(self, name: str, params: dict) -> dict:
@@ -127,6 +156,8 @@ class Service:
         try:
             if name == "search_kb":
                 return self.retrieve(cleaned["query"], cleaned.get("top_k", 5))
+            if name == "read_doc":
+                return self.read_doc(cleaned["doc_id"])
             return getattr(self.tools, name)(**cleaned)
         except (TypeError, ValueError, sqlite3.Error) as exc:
             hint = ""

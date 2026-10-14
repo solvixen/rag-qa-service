@@ -98,6 +98,19 @@ TOOLS = [
         },
         ["query"],
     ),
+    _fn(
+        "read_doc",
+        "按编号读取一篇文档的完整正文。search_kb 返回的片段里看不出答案、"
+        "但你能判断答案就在某篇已知编号的文档里时（例如只拿到了标题行、"
+        "或片段明确说答案在文档别处），用这个工具把整篇读出来再回答。",
+        {
+            "doc_id": {
+                "type": "string",
+                "description": "文档编号，形如 KB-022（编号来自 search_kb 的返回）",
+            }
+        },
+        ["doc_id"],
+    ),
 ]
 
 TOOL_NAMES = [tool["function"]["name"] for tool in TOOLS]
