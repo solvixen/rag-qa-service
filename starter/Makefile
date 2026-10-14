@@ -1,7 +1,8 @@
 # 经营看板 + 问答服务
 # 换数据或知识库：make rebuild DATA_DIR=/path/data KB_DIR=/path/kb
 
-PY ?= .venv/bin/python
+# Unix 用 .venv/bin/python，Windows 用 .venv/Scripts/python.exe——按实际存在的那个选。
+PY ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo .venv/Scripts/python.exe; fi)
 PORT ?= 8000
 export DATA_DIR KB_DIR VAR_DIR LLM_BASE_URL LLM_API_KEY LLM_MODEL
 

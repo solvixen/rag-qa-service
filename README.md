@@ -5,7 +5,7 @@
 本仓库是 Moneki.ai 全栈实习实操作业的完整交付：接手一个答不准的 RAG 问答服务，
 从零修复并扩展为「查数据库 + 查公司文档」的混合问答系统，并配套经营看板与调试面板。
 
-- **评测成绩**：公开题库 100/100（十个类别全满），97 项测试全绿（交付后自查增补 15 项，见 `DEBUG_LOG.md` 缺陷 23–25）
+- **评测成绩**：公开题库 100/100（十个类别全满），134 项测试全绿（含交付后自查与评审反馈修复增补的用例，见 `DEBUG_LOG.md` 缺陷 23–28）
 - **交付内容**：RAG 问答服务（FastAPI）+ Vue3 经营看板（Vite + ECharts）+ 调试追踪面板
 - **评测即回归**：`python eval/run_regression.py` 一条命令复跑全部分数，任何类别退步即失败（含 GitHub Actions）
 - **亮点导航**：架构图见下方「架构图」节；口径与歧义的取舍见「工程决策记录」节
@@ -223,15 +223,48 @@ UI / 交互设计与创新功能单独设奖，不设分值上限。
 
 # 以下为候选人补充
 
-## 快速运行（验证过的步骤）
+## 快速运行（从干净机器到跑起来，四步）
+
+需要 **Python 3.12**（`python --version` 确认）。下面命令都在 `starter/` 目录里执行。
+
+### 1. 建虚拟环境、装依赖
 
 ```bash
-cd starter
-.venv/Scripts/python.exe -m kbqa.rebuild          # 重建：清洗表 + 检索索引（数据或代码变过必须重跑）
-.venv/Scripts/python.exe -m uvicorn kbqa.server:app --host 127.0.0.1 --port 8000
+python -m venv .venv
+# macOS / Linux
+.venv/bin/python -m pip install -r requirements.txt
+# Windows（PowerShell / CMD）
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-另开一个终端，在仓库根目录：
+只依赖 `fastapi`、`uvicorn`、`httpx`、`pytest` 四个包，不需要额外服务。
+装了 `uv` 的话，`make setup` 等价于上面这两行。
+
+### 2. 重建清洗表与检索索引
+
+```bash
+# macOS / Linux
+.venv/bin/python -m kbqa.rebuild
+# Windows
+.venv\Scripts\python.exe -m kbqa.rebuild
+```
+
+换过 `../data/` 或 `../knowledge_base/`、或改过解析代码，都必须重跑这一步。
+这条命令是**显式重建**（`rebuild=True`，不靠缓存命中省时间）；缓存键本身还包含
+知识库全部受支持文件的内容指纹，所以常规启动路径下换库也不会复用旧索引。
+
+### 3. 起服务
+
+```bash
+# macOS / Linux
+.venv/bin/python -m uvicorn kbqa.server:app --host 127.0.0.1 --port 8000
+# Windows
+.venv\Scripts\python.exe -m uvicorn kbqa.server:app --host 127.0.0.1 --port 8000
+```
+
+没有配置 `LLM_*` 环境变量时会以 mock 降级模式启动（契约 §7.2），题库照跑。
+
+### 4. 另开一个终端，在仓库根目录跑评测
 
 ```bash
 python eval/run_eval.py --base-url http://localhost:8000 --questions eval/public_questions.jsonl
