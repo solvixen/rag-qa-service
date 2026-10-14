@@ -142,6 +142,39 @@ class LiveEngine:
                         "bad_tool_args",
                         "模型连续 %d 轮给出无法解析的工具参数" % bad_args,
                     )
+        return self._deliver_or_raise(plan, evidence, retrieved, trace)
+
+    def _deliver_or_raise(
+        self, plan: Plan, evidence: list[dict], retrieved: dict[str, list], trace
+    ) -> Answer:
+        """轮数用尽时的收尾：手里有料就先交付，真没料才拒绝（缺陷 27）。
+
+        原来这里直接 raise LLMError("tool_loop")。问题是那个唯一交付口（上面
+        `if not reply.tool_calls` 那一句）在 for 循环**里面**，raise 在循环**外面**：
+        只要这 7 轮里取到过数据、或检索过文档，evidence / retrieved 里其实是有料的，
+        却被 raise 整个丢掉，用户拿到的是"模型服务这次没有正常返回（工具调用没有收敛）"。
+        工具调用的钱花了、数据也拿到了，最后什么都没给——比答得不好更糟。
+
+        真没料（工具全报错、也一次没检索过）时继续 raise：拒绝回答才是诚实的。
+        """
+        if evidence or retrieved:
+            trace.step(
+                "tool_loop_fallback",
+                {
+                    "rounds": MAX_TOOL_ROUNDS,
+                    "evidence_calls": len(evidence),
+                    "retrieved_queries": len(retrieved),
+                },
+            )
+            fallback = self.answerer.answer(plan, trace)
+            if not fallback.data_evidence:
+                # 模板自己一条数都没取到时，把模型已经取到的证据带上，别让它白跑。
+                fallback.data_evidence = trim_evidence(evidence)
+            fallback.notes.append(
+                "模型连续 %d 轮只调工具、没有给出结论，已改用按工具结果渲染的模板回答。"
+                % MAX_TOOL_ROUNDS
+            )
+            return fallback
         raise LLMError("tool_loop", "工具调用超过 %d 轮仍未给出回答" % MAX_TOOL_ROUNDS)
 
     # -- 组装 -------------------------------------------------------------------
