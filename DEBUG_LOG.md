@@ -341,3 +341,79 @@
 - 公开题库（mock 模式）：**100.00 / 100.00**，与修复前一致——本次改动只在 SQL 出错路径与工具描述上，不动作答逻辑。
 - 端到端（deepseek-flash，重启服务后全量公开题库）：**96.00 / 100.00**。直接验证效果：**H06 由 4/4 稳定失分转为满分**；此前 flaky 的 D06 / H02 / H03 / T03 / V01 **全部转绿**；整份报告 `no such table` 出现 **0 次**；失分集合由 5~6 项收敛至 **2 项**（H04 证据数字超限 61>60、T02 检索侧召回缺块）。此前 85.5 那种塌方从机制上不再可能——分数从此钉在一个窄区间里。
 
+---
+
+# 交付后第二轮：评审反馈修复（缺陷 26–30）
+
+前 25 条是 9/26 交付前的工作。9/26 之后又修了四条（23–26），但**评审看到的是 9/26 那个快照**，这几条没进他们的视野——这是本次最大的教训（见缺陷 26 后的说明）。10/13 收到评审反馈，按反馈逐条复核，又修了四条（27–30）。
+
+## 缺陷 26（I）：evidence 数字总量预算——多次工具调用累加会越评测上限
+
+| 项 | 内容 |
+|---|---|
+| 现象 | live 全量里 H04（"哪个商品当天销量最高、单价多少"）稳定失分，报告报 `evidence_hygiene`：证据里的数字总量 61 > 评测上限 60。同一题在 mock 下满分。 |
+| 假设 | ① 是模型多查了一次吗？② 还是某一次工具返回里数字本身就超了？ |
+| 验证 | 把两条工具结果分别数一遍：`top_products` 30 个数字、`unit_price_check` 31 个，**单看都不超 60，合起来 61**。再用评测脚本的 `extract_numbers` 逻辑复核计数口径，确认一致（它忽略日期与编号）。 |
+| 根因 | `starter/kbqa/live.py` 的 `evidence` 是**跨轮累加**的 list，原实现把每一轮的完整工具结果原样塞进去；模型调用工具的次数越多，数字总量越容易越界。mock 路径只调一次工具，所以看不出这个问题。 |
+| 修复 | commit `02e0904`：新增 `EVIDENCE_NUMBER_BUDGET = 50`、`count_numbers()`、`trim_evidence()`，接在 `live.py:196` 的**输出侧**按"倒序收集、放得下才留、一条都放不下时保底留最后一条"裁剪。位置很关键：早于 `:172` 会让 `_allowed_numbers` 的允许集合跟着变小 → 模型正文里的合法数字被判 `number_check_failed` → 整条答案被换成模板。 |
+| 回归测试 | `tests/test_batch10_evidence_budget.py` 3 例。 |
+
+**★这一条换来的通用教训**：交卷之后再修的代码，如果不重新提交/告知接收方，等于没做。缺陷 23（缓存键）、25（SQL 表名）在 10/6–10/8 就修好了，但评审手里的 9/26 快照里它们还在。→ 凡作品类考核，交付后任何改动都要同步对方，并保留"对方看到的是哪一版"的锚点。
+
+## 缺陷 27（J）：模型不收敛时，手里有数据却直接 raise——唯一交付口在循环内
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 偶发 refusal，答复文本恒为"模型服务这次没有正常返回（工具调用没有收敛）"。 |
+| 假设 | ① 模型真的没查到东西吗？② 还是查到了但没交付？ |
+| 验证 | 看 trace：`tool` 步骤有**多次成功返回**（evidence 非空），随后直接跳到 `answer_live_failed {kind: "tool_loop"}`。反查链＝报告中文症状 → `service.py:240` 的 `_reason_cn` 翻译表 → `kind="tool_loop"` → 搜 `live.py` 的 `raise LLMError` → 唯一命中 `:145`。再看代码结构：唯一交付口 `if not reply.tool_calls: return self._finalise(...)` 在 `for` 循环**里面**，`raise` 在循环**外面**——7 轮全不收敛时交付口一次都没执行，局部变量 `evidence` / `retrieved` 随函数退出销毁。 |
+| 根因 | `starter/kbqa/live.py:145` 无条件 `raise LLMError("tool_loop", ...)`。病不在"没查到"，而在"查到了却不交付"：工具调用的钱花了、数据也拿到了，最后什么都没给。 |
+| 修复 | commit `de33c22`：抽出 `_deliver_or_raise()`——`evidence` 或 `retrieved` 任一非空时，先 `trace.step("tool_loop_fallback", {...})` 留痕，再用 `answerer` 模板渲染答案（模板自己一条数都没取到时把 evidence 带上），并追加一条 notes 说明降级；真没料（工具全报错且一次没检索）才继续 raise。 |
+| 回归测试 | `tests/test_batch11_tool_loop_fallback.py` 5 例：3 条主断言（有 evidence 交付、有 retrieved 交付、trace 留痕）修复前必红，2 条守卫（真没料仍拒绝、正常"取数→作答"路径不受影响且不留降级痕）修复前就该绿。**修复前 3 failed / 2 passed**。 |
+
+**为什么不是"多给几轮"**：加轮数只是把撞墙的位置往后挪，模型不收敛可能是提示词或模型能力问题，轮数解决不了；而"手里有数据"是确定的事实——已经付费拿到的证据不该被丢掉。另一半也守住：真没料时继续拒绝，不给没有依据的数字。
+
+## 缺陷 28（K）：run_sql 走可写连接，评审实测能 DELETE 删数据（安全洞）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 评审反馈原文："`run_sql` 仍走可写连接：`cleaning.py:98-102` 的 `open_readonly()` 实际是普通读写连接，`tools.py:76-81` 的 `run_sql` 原样执行并 `commit()`，而它是暴露给模型的工具。我们在一份数据库副本上直接调用这个工具执行 DELETE，数据确实会被删掉。" |
+| 假设 | 函数名叫 `open_readonly`，字面上就是只读——先假设名字是真的，把怀疑点放到别处（比如提示词层拦截）。 |
+| 验证 | 不看名字看行为，直接写红测复核：`Service.run_tool("run_sql", {"sql": "DELETE FROM sales_clean"})` 之后 `valid_sales_rows()` **从 18290 变成 0**（实测断言 `0 == 18290`）。评审说的是真的，而且不是"理论上能删"。 |
+| 根因 | 两层都缺：① `starter/kbqa/cleaning.py:100` 用的是普通 `sqlite3.connect(path.as_posix())`，拿到的是可写连接（函数名与行为不符，docstring 也只写"打开数据库"）；② `starter/kbqa/tools.py:78-80` 对传入 SQL 不做任何限制，执行完还 `conn.commit()` 落盘。这个连接同时服务于 `build_clean_db` 读源库，"只读"的意图本来是明确的，只是没实现。 |
+| 修复 | commit `7a64c44`：① `open_readonly()` 改用 URI `mode=ro`（`path.resolve().as_uri() + "?mode=ro"`）打开，写语句被 SQLite 直接拒绝（`attempt to write a readonly database`）；② `run_sql` 加语句白名单 `_reject_reason()`——只放行单条 `SELECT` / `WITH`，写语句、DDL、PRAGMA 写、ATTACH、多语句一律返回可读 error，并去掉 `commit()`。两层都保留：任意一层单独失效还有另一层兜底。 |
+| 回归测试 | `tests/test_batch12_run_sql_readonly.py` 16 例：只读连接执行 DELETE 必须抛 `OperationalError`；10 条语句（DELETE / UPDATE / INSERT / DROP / ALTER / CREATE / PRAGMA 写 / ATTACH / VACUUM / 多语句）必须被拒；守卫 4 条（只读连接仍能读、SELECT 与 WITH 正常、集成层"尝试写之后行数不变"）。**修复前 13 failed / 3 passed**。 |
+
+## 缺陷 29（L）：T02——召回了文档，却召不回答案那一段
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 混合题 / 多轮追问（T02 类）间歇失分：模型反复换词检索，最后撞上 `tool_loop`。标本题＝"三文鱼供应商赔了多少钱"，答案在 KB-022（英文商务邮件）第 9 段："We will issue a credit note of CNY 8,600 against your July account." |
+| 假设 | ① 是 KB-022 根本没被召回吗？② 还是召回了，但有用的那一段排在 top-k 之外？ |
+| 验证 | 直接打检索：`search_kb("三文鱼供应商赔偿", top_k=5)` 的返回里 **KB-022 确实在**（score 26.05，第 4 位），但返回的片段是它的 Subject 行 `KB-022#2`；含答案的 `KB-022#9` **不在 top-5**。逐 query 对比排名后确认机理：该段是纯英文（`credit note` / `CNY 8,600`），不含任何中文查询词，BM25 的 bigram 与英文实词交集为空，因此打不上分。 |
+| 根因 | 这条严格说不是 bug，是**分块排名的能力边界**：整段没有查询词的片段天然拿不到分。而模型的处境是"看见了像是对的那篇文档，却拿不到里面的数字"，只能反复换词重试 → 轮数耗尽。 |
+| 修复 | commit `8ad4335`：新增 `read_doc(doc_id)` 工具——已经知道文档编号时直接读全文，绕开分块排名，给模型一条**确定性通道**。`toolspec.py` 注册并写清"什么时候用"；`service.read_doc()` 从 `index.texts` 取正文，编号大小写宽容，未知编号返回可读 error，正文超 6000 字符截断并标记。 |
+| 回归测试 | `tests/test_batch13_read_doc.py` 8 例：`test_search_cannot_reach_the_answer_chunk` 钉住前提（检索确实拿不到答案片段）、`test_read_doc_returns_the_full_text` 钉住能力（全文含 `CNY 8,600`），另有整篇长度大于任一片段、大小写宽容、未知编号返回 error、缺参被拦，以及契约守卫 `test_search_kb_payload_unchanged`。**修复前 4 failed / 4 passed**。 |
+
+**为什么不是"改检索算法把它排上来"**：可以给英文实词加权（`retriever.py` 里已有 `CROSS_LANG_WEIGHT`），但那是**用猜测补语义**——这次能命中是因为目标段恰好含英文实体词，换一篇不含实体词的文档就失效。`read_doc` 走的是另一条逻辑：**编号是确定的，读取是确定的**，不赌排名运气。两条路互补，不是替代。
+
+## 缺陷 30（M）：live 检索不留痕——看不到片段分数与被过滤的原因
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 评审反馈原文："调试面板只把每一步的原始 JSON 折叠展示，读起来费力；接上真实模型后，模型自己调用的检索只记工具名和参数，看不到检索片段的分数和被过滤的原因。" |
+| 假设 | 先分清是"没记"还是"记了但没渲染"。 |
+| 验证 | 看 `live.py` 的 `trace.step("tool", {"tool": name, "params": params})`：确实只记了名与参数。而 `retriever.SearchResult.as_trace()` **本来就已经算好了** query / expansions / coverage / hits（含 score、padded、dropped_instructions）/ filtered——数据是齐的，只是没带出来、也没渲染。 |
+| 根因 | 两处断链：① 工具返回值里没有任何检索诊断字段，trace 想记也无从取；② 前端 `TraceView.vue` 对每一步一律折叠原始 JSON，没有分区视图。 |
+| 修复 | commit `11aac0b`：后端 `service.py` 抽出 `_search()`，`run_tool` 的 `search_kb` 分支额外带出 `_diagnostics = SearchResult.as_trace()`；`live.py` 在**喂给模型之前**把它摘出来写进 trace 的 `tool` 步骤（`detail.retrieval`），模型上下文里仍是干净的 `results`（有测试守卫）。前端 `TraceView.vue` 重写：新增「一眼看全」概览、「检索诊断」分区（片段编号 / 分数 / 正常命中·凑数补齐·已丢弃文档内指令的标记 + 被过滤文档与原因），时间线每步加一句话摘要，原始 JSON 仍可展开。 |
+| 回归测试 | `tests/test_batch14_live_retrieval_trace.py` 5 例：工具返回带诊断、trace 里能看到分数、被过滤原因是 list（空也要有这个键）、模型看不到 `_diagnostics`（守卫）、`results` 结构不变（契约守卫）。**修复前 3 failed / 2 passed**；前端 `vite build` 通过。 |
+
+## 验证结果（批次 10–14 / 评审反馈修复）
+
+- 红测顺序（每处都是先有会红的测试、再改代码）：批 12 = **13 failed** → 全绿；批 13 = **4 failed** → 全绿；批 11 = **3 failed** → 全绿；批 14 = **3 failed** → 全绿。
+- 全量单测：**134 passed**（9/26 交付时 97 → 本轮 +37）。
+- 公开题库（mock 模式，带 `--kb knowledge_base` 硬校验）：**100.00 / 100.00**，十类全满，与修复前一致——本轮改动没有动任何作答口径：安全洞只在工具层、检索留痕只在观测层、`read_doc` 是新工具、fallback 只在原本会 raise 的路径上生效。
+- 换库 / 换文档（评审第 3 步的场景）：`tests/test_batch7_index_cache.py` 9 例复核全绿（换库、加文档、改文档、删文档、只动 mtime、`rebuild=True` 强制重算）——评审反馈第 1 条（缓存键不含知识库内容）在 `5f4644f` 已修复，只是没进 9/26 那个快照。
+- 服务自检（`/api/health`）：`kb_docs=35`、`kb_chunks=134`、`valid_sales_rows=18290`、`index_key=56155d8e4c9f`，与基线一致。
+- 交付卫生：README「快速运行」补齐建环境 / 装依赖与跨平台命令；删除跟踪中的调试残留 `starter/body.json`、`starter/chat.json`（commit `c649e4f`）。
+
