@@ -96,8 +96,19 @@ class CleaningReport:
 
 
 def open_readonly(path: Path) -> sqlite3.Connection:
-    """打开数据库。"""
-    conn = sqlite3.connect(path.as_posix(), check_same_thread=False)
+    """以**真只读**方式打开数据库（URI `mode=ro`）。
+
+    普通 ``sqlite3.connect`` 拿到的是可写连接，而 clean 库这条连接被挂到了
+    暴露给模型的 ``run_sql`` 工具上——评审在一份数据库副本上直接调该工具执行
+    DELETE，数据确实被删掉了。改成 mode=ro 之后，任何写语句都会被 SQLite
+    直接拒绝（attempt to write a readonly database），这是语句白名单之外
+    的第二层防线；两条都留着，任意一条单独失效都还有兜底。
+
+    源库 data/pos.db 同样走这个函数，本来就只该被读。
+    """
+    conn = sqlite3.connect(
+        path.resolve().as_uri() + "?mode=ro", uri=True, check_same_thread=False
+    )
     conn.row_factory = sqlite3.Row
     return conn
 

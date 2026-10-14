@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 from datetime import date, timedelta
@@ -12,6 +13,22 @@ from typing import Any, Optional
 from .cleaning import open_readonly
 
 METRIC_FIELDS = ("net_revenue", "refund_amount", "orders", "aov", "qty")
+
+#: run_sql 只放行只读查询：单条 SELECT 或 WITH（CTE）。
+_READ_ONLY_SQL = re.compile(r"^(select|with)\b", re.IGNORECASE)
+
+
+def _reject_reason(sql: str) -> Optional[str]:
+    """返回拒绝原因；返回 None 表示这是一条允许执行的只读查询。"""
+    text = (sql or "").strip()
+    if not text:
+        return "的 SQL 是空的"
+    body = text.rstrip(";").strip()
+    if ";" in body:
+        return "一次只允许执行一条语句"
+    if not _READ_ONLY_SQL.match(body):
+        return "只允许 SELECT / WITH 查询"
+    return None
 
 
 def yuan(cents: int) -> float:
@@ -74,10 +91,21 @@ class DataTools:
         return int(self.conn.execute("SELECT COUNT(*) FROM sales_clean").fetchone()[0])
 
     def run_sql(self, sql: str) -> dict:
-        """执行一条 SQL。工具覆盖不到的查法，让模型自己写。"""
+        """执行一条**只读** SQL。工具覆盖不到的查法，让模型自己写。
+
+        这是暴露给模型的工具，所以只放行单条 SELECT / WITH：写语句、DDL、
+        PRAGMA 写、ATTACH、多语句一律拒绝。连接本身也已经用 mode=ro 打开，
+        这里再挡一道，是为了让模型拿到一句能读懂的错误、好在下一轮自己改对，
+        而不是撞上 "attempt to write a readonly database" 这种底层提示。
+        """
+        reason = _reject_reason(sql)
+        if reason:
+            return {
+                "error": "run_sql 被拒绝：%s（收到 %r）。这个工具只做查询，"
+                "需要取数请用上面列出的专用工具。" % (reason, sql)
+            }
         cursor = self.conn.execute(sql)
         rows = [dict(row) for row in cursor.fetchall()] if cursor.description else []
-        self.conn.commit()
         return {"sql": sql, "rows": rows[:50], "row_count": len(rows)}
 
     def schema_hint(self) -> str:
